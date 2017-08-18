@@ -10,6 +10,7 @@
 
 namespace Go\Instrument\ClassLoading;
 
+use Go\Aop\AspectException;
 use Go\Core\AspectContainer;
 use Go\Instrument\FileSystem\Enumerator;
 use Go\Instrument\PathResolver;
@@ -22,6 +23,19 @@ use Doctrine\Common\Annotations\AnnotationRegistry;
  */
 class AopComposerLoader
 {
+    /**
+     * List of packages to exclude from analysis
+     *
+     * @var array
+     */
+    public static $excludedPackages = [
+        'Dissect',
+        'Doctrine\\Common\Lexer\\',
+        'Doctrine\\Common\\Annotations\\',
+        'Go\\',
+        'Go\\ParserReflection\\',
+        'PhpParser\\'
+    ];
 
     /**
      * Instance of original autoloader
@@ -52,13 +66,6 @@ class AopComposerLoader
     private $cacheState;
 
     /**
-     * Was initialization successful or not
-     *
-     * @var bool
-     */
-    private static $wasInitialized = false;
-
-    /**
      * Constructs an wrapper for the composer loader
      *
      * @param ClassLoader $original Instance of current loader
@@ -70,21 +77,16 @@ class AopComposerLoader
         $this->options  = $options;
         $this->original = $original;
 
-        $prefixes     = $original->getPrefixes();
+        $prefixes     = $original->getPrefixes() + $original->getPrefixesPsr4();
         $excludePaths = $options['excludePaths'];
 
-        if (!empty($prefixes)) {
-            // Let's exclude core dependencies from that list
-            if (isset($prefixes['Dissect'])) {
-                $excludePaths[] = $prefixes['Dissect'][0];
-            }
-            if (isset($prefixes['Doctrine\\Common\\Annotations\\'])) {
-                $excludePaths[] = substr($prefixes['Doctrine\\Common\\Annotations\\'][0], 0, -16);
+        foreach (self::$excludedPackages as $packageName) {
+            if (isset($prefixes[$packageName])) {
+                $excludePaths[] = PathResolver::realpath($prefixes[$packageName][0]);
             }
         }
 
-        $fileEnumerator       = new Enumerator($options['appDir'], $options['includePaths'], $excludePaths);
-        $this->fileEnumerator = $fileEnumerator;
+        $this->fileEnumerator = new Enumerator($options['appDir'], $options['includePaths'], $excludePaths);
         $this->cacheState     = $container->get('aspect.cache.path.manager')->queryCacheState();
     }
 
@@ -95,11 +97,10 @@ class AopComposerLoader
      *
      * @param array $options Aspect kernel options
      * @param AspectContainer $container
-     *
-     * @return bool was initialization sucessful or not
      */
     public static function init(array $options = [], AspectContainer $container)
     {
+        $wasInitialized = false;
         $loaders = spl_autoload_functions();
 
         foreach ($loaders as &$loader) {
@@ -113,7 +114,7 @@ class AopComposerLoader
                     return class_exists($class, false);
                 });
                 $loader[0] = new AopComposerLoader($loader[0], $container, $options);
-                self::$wasInitialized = true;
+                $wasInitialized = true;
             }
             spl_autoload_unregister($loaderToUnregister);
         }
@@ -123,7 +124,9 @@ class AopComposerLoader
             spl_autoload_register($loader);
         }
 
-        return self::$wasInitialized;
+        if (!$wasInitialized) {
+            throw new AspectException("Initialization of aspect loader failed, check your composer initialization");
+        };
     }
 
     /**
@@ -156,7 +159,14 @@ class AopComposerLoader
         $file = $this->original->findFile($class);
 
         if ($file) {
-            $file = PathResolver::realpath($file)?:$file;
+
+            /**
+             * Composer can return relative paths for >=5.6
+             * @see https://github.com/composer/composer/pull/5174
+             */
+            if (strpos($file, '..') !== false) {
+                $file = PathResolver::realpath($file);
+            }
             $cacheState = isset($this->cacheState[$file]) ? $this->cacheState[$file] : null;
             if ($cacheState && $isProduction) {
                 $file = $cacheState['cacheUri'] ?: $file;
@@ -167,15 +177,5 @@ class AopComposerLoader
         }
 
         return $file;
-    }
-
-    /**
-     * Whether or not loader was initialized
-     *
-     * @return bool
-     */
-    public static function wasInitialized()
-    {
-        return self::$wasInitialized;
     }
 }
